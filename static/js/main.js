@@ -1950,28 +1950,26 @@ async function loadRegionMapping(plotlyData) {
         plotlyData.data.forEach((trace, traceIndex) => {
             const regionName = trace.name;
             
-            if (!regionName) {
-                console.warn(`❌ Пустое название региона для traceIndex: ${traceIndex}`);
-                return;
-            }
-
-            console.log(`🔍 Поиск mapping для: "${regionName}"`);
-            
-            // 1. Прямое совпадение (точное)
-            let dbRegion = dbRegions.find(region => {
-                if (!region.name) return false;
-                return region.name.trim().toLowerCase() === regionName.trim().toLowerCase();
-            });
-            
+            // 1. Прямое совпадение
+            let dbRegion = dbRegions.find(region => region.name === regionName);
             if (dbRegion) {
                 regionIdMapping[traceIndex] = dbRegion.id;
-                console.log(`✅ Exact match: "${regionName}" -> "${dbRegion.name}" (ID: ${dbRegion.id})`);
+                console.log(`✅ Exact match: ${regionName} -> ${dbRegion.name} (ID: ${dbRegion.id})`);
                 return;
             }
             
-            // 2. Поиск по нормализованным названиям
+            // 2. Прямое mapping по известным соответствиям
+            dbRegion = findDirectRegionMapping(regionName, dbRegions);
+            if (dbRegion) {
+                regionIdMapping[traceIndex] = dbRegion.id;
+                console.log(`✅ Direct mapping: ${regionName} -> ${dbRegion.name} (ID: ${dbRegion.id})`);
+                return;
+            }
+            
+            // 3. Нормализуем названия для сравнения
             const normalizedMapName = normalizeRegionName(regionName);
             
+            // Ищем по нормализованным названиям
             dbRegion = dbRegions.find(region => {
                 if (!region.name) return false;
                 const normalizedDbName = normalizeRegionName(region.name);
@@ -1980,41 +1978,22 @@ async function loadRegionMapping(plotlyData) {
             
             if (dbRegion) {
                 regionIdMapping[traceIndex] = dbRegion.id;
-                console.log(`✅ Normalized match: "${regionName}" -> "${dbRegion.name}" (ID: ${dbRegion.id})`);
+                console.log(`✅ Normalized match: ${regionName} -> ${dbRegion.name} (ID: ${dbRegion.id})`);
                 return;
             }
             
-            // 3. Поиск по частичному совпадению
-            dbRegion = dbRegions.find(region => {
-                if (!region.name) return false;
-                const normalizedDbName = normalizeRegionName(region.name);
-                return normalizedMapName.includes(normalizedDbName) || normalizedDbName.includes(normalizedMapName);
-            });
-            
+            // 4. Поиск по синонимам
+            dbRegion = findRegionBySynonyms(regionName, dbRegions);
             if (dbRegion) {
                 regionIdMapping[traceIndex] = dbRegion.id;
-                console.log(`✅ Partial match: "${regionName}" -> "${dbRegion.name}" (ID: ${dbRegion.id})`);
+                console.log(`✅ Synonym match: ${regionName} -> ${dbRegion.name} (ID: ${dbRegion.id})`);
                 return;
             }
             
-            // 4. Специальные случаи (ручное mapping)
-            const specialMapping = findSpecialRegionMapping(regionName, dbRegions);
-            if (specialMapping) {
-                regionIdMapping[traceIndex] = specialMapping.id;
-                console.log(`✅ Special mapping: "${regionName}" -> "${specialMapping.name}" (ID: ${specialMapping.id})`);
-                return;
-            }
-            
-            console.warn(`❌ Не найден mapping для региона: "${regionName}" (traceIndex: ${traceIndex})`);
+            console.warn(`❌ Не найден mapping для региона: ${regionName} (traceIndex: ${traceIndex})`);
         });
         
         console.log('Final region mapping:', regionIdMapping);
-        
-        // Если mapping пустой, показываем предупреждение
-        if (Object.keys(regionIdMapping).length === 0) {
-            console.error('❌ Не создано ни одного mapping!');
-            showNotification('Ошибка сопоставления регионов. Проверьте названия в базе данных.', 'warning');
-        }
         
     } catch (error) {
         console.error('Ошибка загрузки mapping регионов:', error);

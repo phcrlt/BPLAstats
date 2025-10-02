@@ -23,53 +23,42 @@ class ShapefileProcessor:
         self.db_url = db_url
         self.engine = create_engine(db_url)
 
-    def process_shapefile(file_path):
-        """Основная функция обработки shapefile"""
-        temp_dir = None
+    def debug_table_creation(self):
+        """Метод для отладки создания таблицы"""
         try:
-            processor = ShapefileProcessor()
-            
-            # Извлекаем shapefile если нужно
-            shapefile_path = processor.extract_shapefile(file_path)
-            logger.info(f"Обрабатывается shapefile: {os.path.basename(shapefile_path)}")
-            
-            # Конвертируем в GeoJSON
-            geojson_data, regions_count = processor.shapefile_to_geojson(shapefile_path)
-            
-            if regions_count == 0:
-                return {
-                    "success": False,
-                    "error": "Shapefile не содержит данных"
-                }
-            
-            # Сохраняем GeoJSON в папку uploads (ПЕРЕЗАПИСЫВАЕМ!)
-            geojson_path = save_geojson_to_uploads(geojson_data)
-            
-            # Загружаем в базу данных
-            db_success = processor.load_to_database(geojson_data)
-            
-            # Создаем карту с принудительным обновлением
-            plotly_data = process_geojson_file(geojson_data, force_refresh=True)
-            
-            return {
-                "success": True,
-                "plotly_data": plotly_data,
-                "regions_count": regions_count,
-                "database_updated": db_success,
-                "geojson_saved": geojson_path is not None
-            }
-            
+            with self.engine.connect() as conn:
+                # Проверяем существование таблицы
+                result = conn.execute(text("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'public' AND table_name = 'russia_regions'
+                    );
+                """))
+                exists = result.scalar()
+                logger.info(f"Таблица russia_regions существует: {exists}")
+                
+                if exists:
+                    # Проверяем структуру таблицы
+                    result = conn.execute(text("""
+                        SELECT column_name, data_type 
+                        FROM information_schema.columns 
+                        WHERE table_schema = 'public' AND table_name = 'russia_regions'
+                        ORDER BY ordinal_position;
+                    """))
+                    columns = [f"{row[0]} ({row[1]})" for row in result]
+                    logger.info(f"Структура таблицы: {columns}")
+                    
+                    # Проверяем количество записей
+                    result = conn.execute(text("SELECT COUNT(*) FROM russia_regions;"))
+                    count = result.scalar()
+                    logger.info(f"Количество записей в таблице: {count}")
+                
+                return exists
+                
         except Exception as e:
-            logger.error(f"Ошибка обработки shapefile: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-        finally:
-            # Очищаем временные файлы
-            if temp_dir and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-    
+            logger.error(f"Ошибка при отладке таблицы: {e}")
+            return False
+
     def extract_shapefile(self, file_path):
         """Извлекает shapefile из zip или возвращает путь к существующему файлу"""
         if file_path.lower().endswith('.zip'):
@@ -231,91 +220,126 @@ class ShapefileProcessor:
 
     def create_table_if_not_exists(self):
         """Создает таблицу если она не существует"""
-        with self.engine.connect() as conn:
-            # Проверяем существование таблицы
-            result = conn.execute(text("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = 'russia_regions'
-                );
-            """))
-            table_exists = result.scalar()
-            
-            if not table_exists:
-                logger.info("Создание таблицы russia_regions...")
-                conn.execute(text("""
-                    CREATE TABLE russia_regions (
-                        id SERIAL PRIMARY KEY,
-                        region VARCHAR(200) NOT NULL,
-                        area_sq_km NUMERIC(12, 2),
-                        geometry GEOMETRY(Geometry, 4326),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        try:
+            with self.engine.connect() as conn:
+                # Проверяем существование таблицы
+                result = conn.execute(text("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'public' AND table_name = 'russia_regions'
                     );
                 """))
+                table_exists = result.scalar()
                 
-                # Создаем индексы
-                conn.execute(text("""
-                    CREATE INDEX idx_russia_regions_geom 
-                    ON russia_regions USING GIST (geometry);
+                if not table_exists:
+                    logger.info("Создание таблицы russia_regions...")
+                    conn.execute(text("""
+                        CREATE TABLE russia_regions (
+                            id SERIAL PRIMARY KEY,
+                            region VARCHAR(200) NOT NULL,
+                            area_sq_km NUMERIC(12, 2),
+                            geometry GEOMETRY(Geometry, 4326),
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """))
                     
-                    CREATE INDEX idx_russia_regions_name 
-                    ON russia_regions (region);
-                """))
-                conn.commit()
-                logger.info("Таблица создана")
-            else:
-                logger.info("Таблица уже существует")
+                    # Создаем индексы
+                    conn.execute(text("""
+                        CREATE INDEX idx_russia_regions_geom 
+                        ON russia_regions USING GIST (geometry);
+                        
+                        CREATE INDEX idx_russia_regions_name 
+                        ON russia_regions (region);
+                    """))
+                    conn.commit()
+                    logger.info("✅ Таблица russia_regions создана")
+                    return True
+                else:
+                    logger.info("✅ Таблица russia_regions уже существует")
+                    return True
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания таблицы: {e}")
+            return False
 
     def load_to_database(self, geojson_data):
         """Загружает данные в базу данных PostgreSQL с PostGIS"""
         try:
+            # Сначала отладочная информация
+            logger.info("🔍 Проверка состояния базы данных перед загрузкой...")
+            table_exists_before = self.debug_table_creation()
+            
             # Создаем таблицу если нужно
-            self.create_table_if_not_exists()
+            creation_success = self.create_table_if_not_exists()
+            if not creation_success:
+                logger.error("❌ Не удалось создать таблицу")
+                return False
+            
+            # Проверяем после создания
+            logger.info("🔍 Проверка состояния базы данных после создания таблицы...")
+            table_exists_after = self.debug_table_creation()
+            
+            if not table_exists_after:
+                logger.error("❌ Таблица все еще не существует после попытки создания")
+                return False
             
             # Очищаем таблицу перед загрузкой
             with self.engine.connect() as conn:
                 conn.execute(text("TRUNCATE TABLE russia_regions RESTART IDENTITY;"))
                 conn.commit()
-                logger.info("Таблица очищена")
+                logger.info("✅ Таблица очищена")
             
             # Загружаем данные в базу
+            inserted_count = 0
             with self.engine.connect() as conn:
                 for feature in geojson_data['features']:
                     region_name = feature['properties']['region']
                     geometry_json = json.dumps(feature['geometry'])
                     
-                    # Используем ST_GeomFromGeoJSON для загрузки геометрии
-                    conn.execute(text("""
-                        INSERT INTO russia_regions (region, area_sq_km, geometry)
-                        VALUES (
-                            :region_name,
-                            ST_Area(ST_GeomFromGeoJSON(:geometry)::geography) / 1000000.0,
-                            ST_GeomFromGeoJSON(:geometry)
-                        )
-                    """), {
-                        'region_name': region_name,
-                        'geometry': geometry_json
-                    })
+                    logger.info(f"Загрузка региона: {region_name}")
+                    
+                    try:
+                        # Используем ST_GeomFromGeoJSON для загрузки геометрии
+                        conn.execute(text("""
+                            INSERT INTO russia_regions (region, area_sq_km, geometry)
+                            VALUES (
+                                :region_name,
+                                ST_Area(ST_GeomFromGeoJSON(:geometry)::geography) / 1000000.0,
+                                ST_GeomFromGeoJSON(:geometry)
+                            )
+                        """), {
+                            'region_name': region_name,
+                            'geometry': geometry_json
+                        })
+                        inserted_count += 1
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка вставки региона {region_name}: {e}")
+                        continue
                 
                 # Округляем площади
-                conn.execute(text("""
-                    UPDATE russia_regions 
-                    SET area_sq_km = ROUND(area_sq_km, 2)
-                """))
+                try:
+                    conn.execute(text("""
+                        UPDATE russia_regions 
+                        SET area_sq_km = ROUND(area_sq_km, 2)
+                    """))
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось округлить площади: {e}")
                 
                 conn.commit()
             
-            # Проверяем результат
-            with self.engine.connect() as conn:
-                result = conn.execute(text("SELECT COUNT(*) FROM russia_regions;"))
-                count = result.scalar()
-                
-            logger.info(f"✅ Данные загружены в базу: {count} регионов")
-            return True
+            # Финальная проверка
+            logger.info("🔍 Финальная проверка базы данных...")
+            self.debug_table_creation()
+            
+            logger.info(f"✅ Данные загружены в базу: {inserted_count} регионов")
+            return inserted_count > 0
             
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки в базу: {e}")
+            import traceback
+            logger.error(f"Детали ошибки: {traceback.format_exc()}")
             return False
+
 
 def save_geojson_to_uploads(geojson_data):
     """Сохраняет GeoJSON данные в папку uploads как russia_regions.geojson (ПЕРЕЗАПИСЫВАЕТ!)"""
@@ -337,8 +361,10 @@ def save_geojson_to_uploads(geojson_data):
         logger.error(f"❌ Ошибка сохранения GeoJSON: {e}")
         return None
 
+
 def process_shapefile(file_path, original_filename):
     """Основная функция обработки shapefile"""
+    temp_dir = None
     try:
         processor = ShapefileProcessor()
         
@@ -361,8 +387,8 @@ def process_shapefile(file_path, original_filename):
         # Загружаем в базу данных
         db_success = processor.load_to_database(geojson_data)
         
-        # Создаем карту
-        plotly_data = process_geojson_file(geojson_data)
+        # Создаем карту с принудительным обновлением
+        plotly_data = process_geojson_file(geojson_data, force_refresh=True)
         
         return {
             "success": True,
@@ -378,3 +404,7 @@ def process_shapefile(file_path, original_filename):
             "success": False,
             "error": str(e)
         }
+    finally:
+        # Очищаем временные файлы
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)

@@ -1,7 +1,7 @@
 # uvicorn main:app --reload --host 0.0.0.0 --port 8000
  
 # main.py
-
+from sqlalchemy import create_engine, text
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -19,6 +19,7 @@ import traceback
 from sqlalchemy import text
 from overview_metrics import get_overview_metrics
 import tempfile
+from shapefile_processor import ShapefileProcessor, process_shapefile, save_geojson_to_uploads
 
 # Импортируем настройки из config
 from config import DB_URL, UPLOADS_FOLDER
@@ -287,6 +288,23 @@ async def process_geojson_file_handler(file: UploadFile):
         print(f"Количество features: {len(input_data['features'])}")
         print(f"Файл сохранен как: {file_path}")
         
+        # 🔥 ВАЖНОЕ ИСПРАВЛЕНИЕ: Загружаем GeoJSON в базу данных
+        print("🔄 Загрузка GeoJSON данных в базу данных...")
+        processor = ShapefileProcessor()
+        
+        # Создаем таблицу если не существует
+        table_created = processor.create_table_if_not_exists()
+        if not table_created:
+            print("❌ Не удалось создать таблицу russia_regions")
+        
+        # Загружаем данные в базу
+        db_success = processor.load_to_database(input_data)
+        
+        if db_success:
+            print(f"✅ GeoJSON данные успешно загружены в базу данных")
+        else:
+            print(f"⚠️ Не удалось загрузить GeoJSON данные в базу")
+        
         # Обрабатываем файл через функцию из map_builder с ПРИНУДИТЕЛЬНЫМ ОБНОВЛЕНИЕМ
         plotly_data = process_geojson_file(input_data, force_refresh=True)
         
@@ -297,6 +315,7 @@ async def process_geojson_file_handler(file: UploadFile):
                 "saved_as": "russia_regions.geojson",
                 "file_type": "geojson",
                 "regions_count": len(input_data['features']),
+                "database_updated": db_success,  # 🔥 Добавляем информацию о загрузке в БД
                 "upload_time": datetime.now().isoformat()
             }
         })
@@ -469,3 +488,37 @@ async def process_flight_data_handler(file: UploadFile):
             "success": False,
             "error": f"Ошибка обработки файла с данными о полетах: {str(e)}"
         }
+    
+async def save_geojson_to_database(geojson_data):
+    engine = create_engine(DB_URL)
+    with engine.connect() as conn:
+        # Создаём таблицу, если не существует
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS russia_regions (
+                id SERIAL PRIMARY KEY,
+                region VARCHAR(200) NOT NULL,
+                area_sq_km NUMERIC(12, 2),
+                geometry GEOMETRY(Geometry, 4326)
+            );
+        """))
+        conn.execute(text("TRUNCATE TABLE russia_regions RESTART IDENTITY;"))
+        conn.commit()
+
+        # Вставляем регионы
+        for feature in geojson_data['features']:
+            region_name = feature['properties'].get('region', 'Неизвестный регион')
+            geometry_json = json.dumps(feature['geometry'])
+            conn.execute(text("""
+                INSERT INTO russia_regions (region, area_sq_km, geometry)
+                VALUES (
+                    :region_name,
+                    ST_Area(ST_GeomFromGeoJSON(:geometry)::geography) / 1000000.0,
+                    ST_GeomFromGeoJSON(:geometry)
+                )
+            """), {
+                'region_name': region_name,
+                'geometry': geometry_json
+            })
+        conn.execute(text("UPDATE russia_regions SET area_sq_km = ROUND(area_sq_km, 2)"))
+        conn.commit()
+    print("✅ Таблица russia_regions обновлена из GeoJSON")
